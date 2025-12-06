@@ -1,17 +1,26 @@
 {
   "name": "source2prompt-tui",
   "version": "0.3.0",
-  "description": "Hybrid world-class TUI version of Your Source to Prompt (Bun + TypeScript + Ink).",
+  "description": "World-class TUI for combining source code files into LLM-ready prompts (Bun + TypeScript + Ink).",
+  "license": "MIT",
   "type": "module",
   "bin": {
-    "s2p": "dist/index.js"
+    "s2p": "./dist/s2p"
   },
   "scripts": {
     "dev": "bun run src/index.tsx",
     "build": "tsc",
-    "build:bin": "bun build ./src/index.tsx --compile --minify --sourcemap --outfile s2p"
+    "build:bin": "bun build src/index.tsx --compile --minify --outfile dist/s2p",
+    "build:mac-arm64": "bun build src/index.tsx --compile --target=bun-darwin-arm64 --minify --outfile dist/s2p-macos-arm64",
+    "build:mac-x64": "bun build src/index.tsx --compile --target=bun-darwin-x64 --minify --outfile dist/s2p-macos-x64",
+    "build:linux-x64": "bun build src/index.tsx --compile --target=bun-linux-x64 --minify --outfile dist/s2p-linux-x64",
+    "build:linux-arm64": "bun build src/index.tsx --compile --target=bun-linux-arm64 --minify --outfile dist/s2p-linux-arm64",
+    "build:all": "bun run build:mac-arm64 && bun run build:mac-x64 && bun run build:linux-x64 && bun run build:linux-arm64",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck"
   },
   "dependencies": {
+    "clipboardy": "^4.0.0",
     "csso": "^5.0.5",
     "html-minifier-terser": "^7.2.0",
     "ignore": "^5.3.0",
@@ -22,7 +31,6 @@
     "ink-syntax-highlight": "^2.0.0",
     "ink-text-input": "^6.0.0",
     "js-tiktoken": "^1.0.14",
-    "clipboardy": "^4.0.0",
     "react": "^18.3.0",
     "terser": "^5.31.0"
   },
