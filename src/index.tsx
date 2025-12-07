@@ -879,23 +879,35 @@ function buildProjectTreeLines(
     return [];
   }
 
-  lines.push("<project_tree>");
+  lines.push("<project_structure>");
 
-  const printNode = (node: FileNode, prefix: string) => {
+  const printNode = (node: FileNode, prefix: string, isLast: boolean) => {
     if (!hasSelected(node)) return;
     const isRoot = node.relPath === ".";
-    const label = isRoot ? node.name : node.relPath;
-    const icon = node.isDirectory ? "+" : "-";
-    lines.push(`${prefix}${icon} ${label}`);
+    const connector = isRoot ? "" : (isLast ? "└── " : "├── ");
+    const childPrefix = isRoot ? "" : (prefix + (isLast ? "    " : "│   "));
+
+    if (node.isDirectory) {
+      const label = isRoot ? node.name + "/" : node.name + "/";
+      lines.push(`${prefix}${connector}${label}`);
+    } else {
+      // File with size and line count like the HTML version
+      const sizeKb = (node.sizeBytes / 1024).toFixed(2);
+      const fileInfo = `(Size: ${sizeKb}kb; Lines: ${node.numLines.toLocaleString()})`;
+      lines.push(`${prefix}${connector}${node.name} ${fileInfo}`);
+    }
+
     if (node.children && node.children.length) {
-      for (const child of node.children) {
-        printNode(child, prefix + "  ");
-      }
+      const selectedChildren = node.children.filter(c => hasSelected(c));
+      selectedChildren.forEach((child, idx) => {
+        const childIsLast = idx === selectedChildren.length - 1;
+        printNode(child, childPrefix, childIsLast);
+      });
     }
   };
 
-  printNode(root, "");
-  lines.push("</project_tree>");
+  printNode(root, "", true);
+  lines.push("</project_structure>");
 
   return lines;
 }
@@ -1199,6 +1211,7 @@ const App: React.FC = () => {
   const [statsTokens, setStatsTokens] = useState(0);
   const [statsSizeBytes, setStatsSizeBytes] = useState(0);
   const [statsFileCount, setStatsFileCount] = useState(0);
+  const [statsLineCount, setStatsLineCount] = useState(0);
   const [previewContent, setPreviewContent] = useState("");
   const [previewLang, setPreviewLang] = useState("txt");
 
@@ -1322,6 +1335,10 @@ const App: React.FC = () => {
             (acc, f) => acc + f.sizeBytes,
             0
           );
+          const lines = selectedFiles.reduce(
+            (acc, f) => acc + f.numLines,
+            0
+          );
 
           const tokensFromFiles = selectedFiles.reduce((acc, f) => {
             if (f.content) return acc + countTokens(f.content);
@@ -1337,6 +1354,7 @@ const App: React.FC = () => {
 
           setStatsFileCount(selectedFiles.length);
           setStatsSizeBytes(size);
+          setStatsLineCount(lines);
           setStatsTokens(totalTokens);
         },
         200
@@ -2209,7 +2227,9 @@ const App: React.FC = () => {
                           {node.relPath === "." ? node.name : node.relPath}{" "}
                           {!node.isDirectory &&
                             `(${formatBytes(node.sizeBytes)}${
-                              node.isText ? "" : ", binary"
+                              node.isText
+                                ? ` | ${node.numLines.toLocaleString()} lines`
+                                : ", binary"
                             })`}
                         </Text>
                       </Box>
@@ -2434,11 +2454,11 @@ const App: React.FC = () => {
               )}
               <Box marginTop={1} flexDirection="column">
                 <Text>
-                  Selected size: {formatBytes(statsSizeBytes)} | Files:{" "}
-                  {statsFileCount}
+                  Size: {formatBytes(statsSizeBytes)} | Lines:{" "}
+                  {statsLineCount.toLocaleString()} | Files: {statsFileCount}
                 </Text>
                 <Text dimColor>
-                  Generation: press Ctrl+G to build combined prompt and open Combined view.
+                  Press Ctrl+G to generate combined prompt.
                 </Text>
               </Box>
             </Box>
