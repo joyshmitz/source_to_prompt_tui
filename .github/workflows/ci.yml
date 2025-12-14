@@ -37,9 +37,11 @@ jobs:
             build: |
               bun run build:linux-x64
               bun run build:linux-arm64
+              bun run build:win-x64
             artifacts: |
               dist/s2p-linux-x64
               dist/s2p-linux-arm64
+              dist/s2p-windows-x64.exe
           - os: macos-latest
             build: |
               bun run build:mac-arm64
@@ -66,9 +68,10 @@ jobs:
         run: |
           # Test that at least one binary runs with --help (since this is a TUI, we test basic invocation)
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            timeout 2 ./dist/s2p-linux-x64 --help 2>&1 || echo "TUI exited (expected for non-interactive)"
+            ./dist/s2p-linux-x64 --help >/dev/null
+            file ./dist/s2p-windows-x64.exe | grep -qi 'PE32'
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            timeout 2 ./dist/s2p-macos-arm64 --help 2>&1 || timeout 2 ./dist/s2p-macos-x64 --help 2>&1 || echo "TUI exited (expected for non-interactive)"
+            ./dist/s2p-macos-arm64 --help >/dev/null || ./dist/s2p-macos-x64 --help >/dev/null
           fi
         shell: bash
       - name: Upload artifacts
@@ -94,10 +97,16 @@ jobs:
           set -euo pipefail
           cd dist
           shopt -s nullglob
+          binaries=()
           for f in s2p-*; do
+            [[ "$f" == *.sha256 ]] && continue
+            [[ "$f" == "sha256.txt" ]] && continue
+            binaries+=("$f")
+          done
+          for f in "${binaries[@]}"; do
             shasum -a 256 "$f" > "${f}.sha256"
           done
-          shasum -a 256 s2p-* > sha256.txt
+          shasum -a 256 "${binaries[@]}" > sha256.txt
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -106,6 +115,7 @@ jobs:
             dist/s2p-linux-arm64
             dist/s2p-macos-x64
             dist/s2p-macos-arm64
+            dist/s2p-windows-x64.exe
             dist/s2p-*.sha256
             dist/sha256.txt
           generate_release_notes: true
