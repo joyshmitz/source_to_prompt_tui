@@ -14,6 +14,7 @@ FROM_SOURCE=0
 LOCK_FILE="/tmp/s2p-install.lock"
 VERIFY=0
 CHECKSUM_URL="${CHECKSUM_URL:-}"
+INSTALL_NAME=""
 
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() { log "\033[0;34m→\033[0m $*"; }
@@ -107,6 +108,9 @@ resolve_version() {
 
 detect_target() {
   OS=$(uname -s | tr 'A-Z' 'a-z')
+  case "$OS" in
+    mingw*|msys*|cygwin*) OS="windows" ;;
+  esac
   ARCH=$(uname -m)
   case "$ARCH" in
     x86_64|amd64) ARCH="x86_64" ;;
@@ -125,8 +129,19 @@ detect_target() {
     linux-aarch64) ASSET="s2p-linux-arm64" ;;
     darwin-arm64) ASSET="s2p-macos-arm64" ;;
     darwin-x86_64) ASSET="s2p-macos-x64" ;;
+    windows-x86_64) ASSET="s2p-windows-x64.exe" ;;
     *) warn "Unknown platform ${OS}/${ARCH}; will build from source (requires git + bun)"; FROM_SOURCE=1 ;;
   esac
+}
+
+compute_install_name() {
+  INSTALL_NAME="$BINARY"
+  if [ "${OS:-}" = "windows" ]; then
+    case "$INSTALL_NAME" in
+      *.exe) ;;
+      *) INSTALL_NAME="${INSTALL_NAME}.exe" ;;
+    esac
+  fi
 }
 
 lock() {
@@ -206,8 +221,8 @@ download_binary() {
     warn "No sha256 utility found; skipping checksum verification"
   fi
 
-  install -m 0755 "$TMP/${ASSET}" "$DEST/${BINARY}"
-  ok "Installed ${BINARY} to $DEST"
+  install -m 0755 "$TMP/${ASSET}" "$DEST/${INSTALL_NAME}"
+  ok "Installed ${INSTALL_NAME} to $DEST"
 }
 
 build_from_source() {
@@ -222,14 +237,19 @@ build_from_source() {
     bun run build:bin
   )
 
-  local bin_path="$TMP/src/dist/${BINARY}"
-  [ -x "$bin_path" ] || { err "Build failed; binary not found"; exit 1; }
-  install -m 0755 "$bin_path" "$DEST/${BINARY}"
-  ok "Installed ${BINARY} to $DEST (built from source)"
+  local built_base="s2p"
+  local bin_path="$TMP/src/dist/${built_base}"
+  if [ ! -f "$bin_path" ] && [ -f "$TMP/src/dist/${built_base}.exe" ]; then
+    bin_path="$TMP/src/dist/${built_base}.exe"
+  fi
+  [ -f "$bin_path" ] || { err "Build failed; binary not found"; exit 1; }
+  install -m 0755 "$bin_path" "$DEST/${INSTALL_NAME}"
+  ok "Installed ${INSTALL_NAME} to $DEST (built from source)"
 }
 
 resolve_version
 detect_target
+compute_install_name
 lock
 TMP=$(mktemp -d)
 trap cleanup EXIT
