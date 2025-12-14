@@ -1,23 +1,54 @@
 #!/usr/bin/env bun
-import React, { useEffect, useMemo, useState } from "react";
-import { render, Box, Text, useInput, useApp, useStdout } from "ink";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { render, Box, Text, useInput, useApp, useStdout, useStdin } from "ink";
 import TextInput from "ink-text-input";
 import Spinner from "ink-spinner";
 import Gradient from "ink-gradient";
 // BigText removed - cfonts breaks bun compile (runtime require of package.json)
 import SyntaxHighlight from "ink-syntax-highlight";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import ignore, { Ignore } from "ignore";
-import clipboardy from "clipboardy";
 import { minify as terserMinify } from "terser";
 import * as csso from "csso";
 import { minify as htmlMinify } from "html-minifier-terser";
 import { encodingForModel, getEncoding, Tiktoken } from "js-tiktoken";
 
 declare const Bun: any;
+
+/* ---------- Concurrency Semaphore ---------- */
+const MAX_CONCURRENT_OPS = 64;
+let activeOps = 0;
+const opQueue: (() => void)[] = [];
+
+async function acquireOp(): Promise<void> {
+  if (activeOps < MAX_CONCURRENT_OPS) {
+    activeOps++;
+    return;
+  }
+  return new Promise<void>(resolve => opQueue.push(resolve));
+}
+
+function releaseOp(): void {
+  activeOps--;
+  if (opQueue.length > 0) {
+    activeOps++; // Immediately take next
+    const next = opQueue.shift()!;
+    next();
+  }
+}
+
+async function withConcurrency<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireOp();
+  try {
+    return await fn();
+  } finally {
+    releaseOp();
+  }
+}
 
 /* ---------- Custom Progress Bar Component ---------- */
 interface ProgressBarProps {
@@ -48,6 +79,7 @@ interface ScrollableBoxProps {
   scrollOffset: number;
   showScrollbar?: boolean;
   accentColor?: string;
+  totalItems?: number; // If provided, assumes children are already sliced (virtual scrolling)
 }
 
 const ScrollableBox: React.FC<ScrollableBoxProps> = ({
@@ -55,12 +87,23 @@ const ScrollableBox: React.FC<ScrollableBoxProps> = ({
   height,
   scrollOffset,
   showScrollbar = true,
-  accentColor = "cyan"
+  accentColor = "cyan",
+  totalItems: explicitTotal
 }) => {
   const childArray = React.Children.toArray(children);
-  const totalItems = childArray.length;
+  
+  let totalItems: number;
+  let visibleChildren: React.ReactNode[];
+
+  if (explicitTotal !== undefined) {
+    totalItems = explicitTotal;
+    visibleChildren = childArray;
+  } else {
+    totalItems = childArray.length;
+    visibleChildren = childArray.slice(scrollOffset, scrollOffset + height);
+  }
+
   const needsScrollbar = totalItems > height;
-  const visibleChildren = childArray.slice(scrollOffset, scrollOffset + height);
 
   // Calculate scrollbar metrics (only used when scrollbar is shown)
   const trackHeight = Math.max(1, height - 2); // -2 for up/down arrows
@@ -176,7 +219,7 @@ const HelpModal: React.FC<HelpModalProps> = ({ rows, cols }) => {
         <Box flexDirection="row" justifyContent="space-between">
           <Box flexDirection="column" width="48%">
             <Text bold color="yellow">Global</Text>
-            <Text>  F1         Show this help</Text>
+            <Text>  F1 / ?     Show this help</Text>
             <Text>  Esc        Exit (press twice to quit)</Text>
             <Text>  Ctrl+C     Force quit</Text>
             <Text>  Ctrl+G     Generate combined prompt</Text>
@@ -190,6 +233,7 @@ const HelpModal: React.FC<HelpModalProps> = ({ rows, cols }) => {
             <Text>  / or f     Filter files</Text>
             <Text>  d          Change root directory</Text>
             <Text>  u          Clear filtered selection</Text>
+            <Text>  a/A        Select/deselect all filtered</Text>
           </Box>
 
           <Box flexDirection="column" width="48%">
@@ -199,10 +243,22 @@ const HelpModal: React.FC<HelpModalProps> = ({ rows, cols }) => {
             <Text></Text>
             <Text bold color="yellow">Config Pane</Text>
             <Text>  Left/Right Switch tabs</Text>
-            <Text>  p/g        Edit preamble/goal</Text>
+            <Text>  p/g        Focus preamble/goal</Text>
+            <Text>  Ctrl+E     Edit in $EDITOR (multiline)</Text>
             <Text>  i/o        Toggle preamble/goal</Text>
             <Text>  x/m        Toggle comments/minify</Text>
             <Text>  s/l/d      Save/load/delete preset</Text>
+            <Text></Text>
+            <Text bold color="yellow">Preview Pane</Text>
+            <Text>  j/k        Scroll preview</Text>
+            <Text>  b/Space    Page up/down</Text>
+            <Text>  g/G        Top/bottom</Text>
+            <Text></Text>
+            <Text bold color="yellow">Prompt Sample</Text>
+            <Text>  z          Collapse/expand</Text>
+            <Text>  j/k        Scroll (when focused)</Text>
+            <Text>  b/Space    Page up/down</Text>
+            <Text>  g/G        Top/bottom</Text>
             <Text></Text>
             <Text bold color="yellow">Combined Output View</Text>
             <Text>  y          Copy to clipboard</Text>
@@ -212,7 +268,7 @@ const HelpModal: React.FC<HelpModalProps> = ({ rows, cols }) => {
         </Box>
 
         <Box justifyContent="center" marginTop={1}>
-          <Text dimColor>Press Esc or F1 to close</Text>
+          <Text dimColor>Press Esc, F1, or ? to close</Text>
         </Box>
       </Box>
     </Box>
@@ -221,7 +277,7 @@ const HelpModal: React.FC<HelpModalProps> = ({ rows, cols }) => {
 
 /* ---------- Types & constants ---------- */
 
-type Pane = "explorer" | "config" | "preview";
+type Pane = "explorer" | "config" | "preview" | "sample";
 type ConfigTab = "inputs" | "presets" | "options";
 type Mode = "main" | "combined";
 
@@ -250,7 +306,7 @@ interface FileNode {
   isText: boolean;
   category: FileCategory;
   numLines: number;
-  content: string; // only for small text files; else ""
+  tokens?: number; // Cached token count
   children?: FileNode[];
 }
 
@@ -413,7 +469,15 @@ const TEXT_EXTENSIONS = new Set<string>([
   ".tf",
   ".tfvars",
   ".dockerfile",
-  ".containerfile"
+  ".containerfile",
+  ".cs",
+  ".dart",
+  ".bat",
+  ".cmd",
+  ".ps1",
+  ".gradle",
+  ".properties",
+  ".cmake"
 ]);
 
 // Files without extensions that are known to be text
@@ -460,6 +524,7 @@ const CONTEXT_WINDOW = 128000;
 const COST_PER_1M_TOKENS = 5.0;
 const MAX_PREVIEW_CHARS = 2000;
 const MAX_READ_BYTES = 5 * 1024 * 1024; // 5MB
+const MAX_INCLUDE_BYTES = 25 * 1024 * 1024; // 25MB safety cap for including a single file
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -512,6 +577,26 @@ function isTextFile(ext: string, filename: string): boolean {
   return false;
 }
 
+function isLargeTextNode(node: FileNode): boolean {
+  return !node.isDirectory && node.isText && node.sizeBytes > MAX_READ_BYTES;
+}
+
+function isSelectableTextNode(node: FileNode): boolean {
+  return !node.isDirectory && node.isText && node.sizeBytes <= MAX_INCLUDE_BYTES;
+}
+
+async function readFileHeadUtf8(filePath: string, maxBytes: number): Promise<string> {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const file = await fsp.open(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes);
+    const { bytesRead } = await file.read(buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await file.close().catch(() => {});
+  }
+}
+
 function languageFromExtension(ext: string): string {
   const e = ext.toLowerCase();
   if (e === ".ts" || e === ".tsx") return "ts";
@@ -534,42 +619,48 @@ function languageFromExtension(ext: string): string {
 async function buildIgnore(rootDir: string): Promise<Ignore> {
   const ig = ignore();
   ig.add(DEFAULT_IGNORES);
+  return ig;
+}
 
-  async function addGitignore(dirAbs: string, relPrefix: string) {
-    const giPath = path.join(dirAbs, ".gitignore");
-    try {
-      const content = await fsp.readFile(giPath, "utf8");
-      const lines = content.split(/\r?\n/);
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const pattern = relPrefix ? path.posix.join(relPrefix, trimmed) : trimmed;
-        ig.add(pattern);
-      }
-    } catch {
-      // ignore
-    }
+type IgnoreRule = { baseRel: string; matcher: Ignore };
 
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(dirAbs, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
-    for (const entry of entries) {
-      if (entry.isDirectory() && entry.name !== ".git") {
-        const childAbs = path.join(dirAbs, entry.name);
-        const childRel = relPrefix
-          ? path.posix.join(relPrefix, entry.name)
-          : entry.name;
-        await addGitignore(childAbs, childRel);
-      }
-    }
+async function loadGitignoreMatcher(dirAbs: string): Promise<Ignore | null> {
+  const giPath = path.join(dirAbs, ".gitignore");
+  let content: string;
+  try {
+    content = await fsp.readFile(giPath, "utf8");
+  } catch {
+    return null;
   }
 
-  await addGitignore(rootDir, "");
-  return ig;
+  const patterns = content
+    .split(/\r?\n/)
+    .map(line => line.trimEnd())
+    .filter(line => line.length > 0 && !line.startsWith("#"));
+
+  if (patterns.length === 0) return null;
+  const matcher = ignore();
+  matcher.add(patterns);
+  return matcher;
+}
+
+function shouldIgnorePath(relPath: string, isDir: boolean, rules: IgnoreRule[]): boolean {
+  const pathForMatch = isDir ? `${relPath}/` : relPath;
+  let ignored = false;
+
+  for (const { baseRel, matcher } of rules) {
+    const candidate = baseRel
+      ? pathForMatch.startsWith(`${baseRel}/`)
+        ? pathForMatch.slice(baseRel.length + 1)
+        : null
+      : pathForMatch;
+    if (!candidate) continue;
+    const res = matcher.test(candidate);
+    if (res.ignored) ignored = true;
+    else if (res.unignored) ignored = false;
+  }
+
+  return ignored;
 }
 
 async function scanProject(
@@ -577,7 +668,7 @@ async function scanProject(
   onProgress?: (info: { processedFiles: number; currentPath?: string }) => void
 ): Promise<{ root: FileNode; flatFiles: FileNode[] }> {
   const resolvedRoot = path.resolve(rootDir);
-  const ig = await buildIgnore(resolvedRoot);
+  const defaultIgnore = await buildIgnore(resolvedRoot);
 
   const root: FileNode = {
     path: resolvedRoot,
@@ -590,14 +681,19 @@ async function scanProject(
     isText: false,
     category: "other",
     numLines: 0,
-    content: "",
     children: []
   };
 
   const flatFiles: FileNode[] = [];
   let processed = 0;
 
-  async function walk(dirAbs: string, parent: FileNode, relDir: string, depth: number) {
+  async function walk(
+    dirAbs: string,
+    parent: FileNode,
+    relDir: string,
+    depth: number,
+    rules: IgnoreRule[]
+  ) {
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dirAbs, { withFileTypes: true });
@@ -607,79 +703,94 @@ async function scanProject(
 
     entries.sort((a, b) => a.name.localeCompare(b.name));
 
-    for (const entry of entries) {
-      const relPath = relDir ? path.posix.join(relDir, entry.name) : entry.name;
-      if (ig.ignores(relPath)) continue;
-
-      const absPath = path.join(dirAbs, entry.name);
-
-      if (entry.isDirectory()) {
-        const node: FileNode = {
-          path: absPath,
-          relPath,
-          name: entry.name,
-          isDirectory: true,
-          sizeBytes: 0,
-          depth: depth + 1,
-          extension: "",
-          isText: false,
-          category: "other",
-          numLines: 0,
-          content: "",
-          children: []
-        };
-        parent.children!.push(node);
-        await walk(absPath, node, relPath, depth + 1);
-      } else if (entry.isFile()) {
-        let sizeBytes = 0;
-        try {
-          const stat = await fsp.stat(absPath);
-          sizeBytes = stat.size;
-        } catch {
-          sizeBytes = 0;
-        }
-
-        const extension = path.extname(entry.name).toLowerCase();
-        let isText = isTextFile(extension, entry.name);
-        let content = "";
-        let numLines = 0;
-
-        if (isText && sizeBytes <= MAX_READ_BYTES) {
-          try {
-            content = await fsp.readFile(absPath, "utf8");
-            numLines = content.split(/\r?\n/).length;
-          } catch {
-            isText = false;
-            content = "";
-          }
-        } else if (isText) {
-          isText = false;
-        }
-
-        const node: FileNode = {
-          path: absPath,
-          relPath,
-          name: entry.name,
-          isDirectory: false,
-          sizeBytes,
-          depth: depth + 1,
-          extension,
-          isText,
-          category: getFileCategory(extension),
-          numLines,
-          content,
-          children: undefined
-        };
-
-        parent.children!.push(node);
-        flatFiles.push(node);
-        processed++;
-        onProgress?.({ processedFiles: processed, currentPath: relPath });
-      }
+    const nextRules = [...rules];
+    const localGitignore = await loadGitignoreMatcher(dirAbs);
+    if (localGitignore) {
+      nextRules.push({ baseRel: relDir, matcher: localGitignore });
     }
+
+    const childrenPromises = entries.map(async (entry) => {
+      return withConcurrency(async () => {
+        const relPath = relDir ? path.posix.join(relDir, entry.name) : entry.name;
+        if (shouldIgnorePath(relPath, entry.isDirectory(), nextRules)) return null;
+
+        const absPath = path.join(dirAbs, entry.name);
+
+        if (entry.isDirectory()) {
+          const node: FileNode = {
+            path: absPath,
+            relPath,
+            name: entry.name,
+            isDirectory: true,
+            sizeBytes: 0,
+            depth: depth + 1,
+            extension: "",
+            isText: false,
+            category: "other",
+            numLines: 0,
+            children: []
+          };
+          await walk(absPath, node, relPath, depth + 1, nextRules);
+          return node;
+        } else if (entry.isFile()) {
+          let sizeBytes = 0;
+          try {
+            const stat = await fsp.stat(absPath);
+            sizeBytes = stat.size;
+          } catch {
+            sizeBytes = 0;
+          }
+
+          const extension = path.extname(entry.name).toLowerCase();
+          let isText = isTextFile(extension, entry.name);
+          let content = "";
+          let numLines = isText && sizeBytes > MAX_READ_BYTES ? -1 : 0;
+          let tokens: number | undefined = undefined;
+
+          if (isText && sizeBytes <= MAX_READ_BYTES) {
+            try {
+              content = await fsp.readFile(absPath, "utf8");
+              numLines = content.length === 0 ? 0 : content.split(/\r?\n/).length;
+              tokens = countTokens(content);
+            } catch {
+              isText = false;
+              content = "";
+              numLines = 0;
+              tokens = undefined;
+            }
+          }
+          // Do not set isText = false for large files; they will be lazy-loaded if selected.
+
+          const node: FileNode = {
+            path: absPath,
+            relPath,
+            name: entry.name,
+            isDirectory: false,
+            sizeBytes,
+            depth: depth + 1,
+            extension,
+            isText,
+            category: getFileCategory(extension),
+            numLines,
+            tokens,
+            children: undefined
+          };
+
+          flatFiles.push(node);
+          processed++;
+          onProgress?.({ processedFiles: processed, currentPath: relPath });
+          return node;
+        }
+        return null;
+      });
+    });
+
+    const results = await Promise.all(childrenPromises);
+    parent.children = results.filter((n): n is FileNode => n !== null);
   }
 
-  await walk(resolvedRoot, root, "", 0);
+  const ignoreRules: IgnoreRule[] = [{ baseRel: "", matcher: defaultIgnore }];
+  await walk(resolvedRoot, root, "", 0, ignoreRules);
 
   const sortRecursive = (n: FileNode) => {
     if (n.children) {
@@ -694,19 +805,174 @@ async function scanProject(
   };
   sortRecursive(root);
 
+  flatFiles.sort((a, b) => a.relPath.localeCompare(b.relPath));
+
   return { root, flatFiles };
 }
 
 /* ---------- Minification & transformation ---------- */
 
 function stripCommentsGeneric(content: string): string {
-  return content
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|\s)\/\/.*$/gm, "$1");
+  let out = "";
+  let i = 0;
+  const len = content.length;
+  let inString: string | null = null; // " ' or `
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  while (i < len) {
+    const c = content[i];
+    const next = i + 1 < len ? content[i + 1] : "";
+
+    if (inLineComment) {
+      if (c === "\n") {
+        inLineComment = false;
+        out += c;
+      }
+      i++;
+    } else if (inBlockComment) {
+      if (c === "*" && next === "/") {
+        inBlockComment = false;
+        i += 2;
+      } else {
+        i++;
+      }
+    } else if (inString) {
+      out += c;
+      if (c === "\\" && i + 1 < len) {
+        out += content[i + 1];
+        i += 2;
+      } else {
+        if (c === inString) inString = null;
+        i++;
+      }
+    } else {
+      // Not in comment or string
+      const prev = i > 0 ? content[i - 1] : "";
+      if (c === "/" && next === "/" && prev !== "\\") {
+        inLineComment = true;
+        i += 2;
+      } else if (c === "/" && next === "*" && prev !== "\\") {
+        inBlockComment = true;
+        i += 2;
+      } else {
+        out += c;
+        if (c === '"' || c === "'" || c === "`") {
+          inString = c;
+        }
+        i++;
+      }
+    }
+  }
+  return out;
 }
 
-function stripHashComments(content: string): string {
-  return content.replace(/(^|\s)#.*$/gm, "$1");
+function stripHashCommentsConservative(content: string): string {
+  const lines = content.split(/\r?\n/);
+  const outLines: string[] = [];
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx] ?? "";
+    if (lineIdx === 0 && line.startsWith("#!")) {
+      outLines.push(line);
+      continue;
+    }
+
+    let out = "";
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]!;
+      if (escaped) {
+        out += c;
+        escaped = false;
+        continue;
+      }
+      if (c === "\\") {
+        out += c;
+        escaped = true;
+        continue;
+      }
+
+      if (!inDouble && c === "'") {
+        inSingle = !inSingle;
+        out += c;
+        continue;
+      }
+      if (!inSingle && c === "\"") {
+        inDouble = !inDouble;
+        out += c;
+        continue;
+      }
+
+      if (!inSingle && !inDouble && c === "#") {
+        // Treat as comment only when it begins a comment token (conservative).
+        const prev = i > 0 ? line[i - 1]! : "";
+        if (i === 0 || /\s/.test(prev)) break;
+      }
+
+      out += c;
+    }
+
+    outLines.push(out.trimEnd());
+  }
+
+  return outLines.join("\n");
+}
+
+function stripHashCommentsPython(content: string): string {
+  const lines = content.split(/\r?\n/);
+  const outLines: string[] = [];
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx] ?? "";
+    if (lineIdx === 0 && line.startsWith("#!")) {
+      outLines.push(line);
+      continue;
+    }
+
+    let out = "";
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]!;
+      if (escaped) {
+        out += c;
+        escaped = false;
+        continue;
+      }
+      if (c === "\\") {
+        out += c;
+        escaped = true;
+        continue;
+      }
+
+      if (!inDouble && c === "'") {
+        inSingle = !inSingle;
+        out += c;
+        continue;
+      }
+      if (!inSingle && c === "\"") {
+        inDouble = !inDouble;
+        out += c;
+        continue;
+      }
+
+      if (!inSingle && !inDouble && c === "#") {
+        break;
+      }
+
+      out += c;
+    }
+
+    outLines.push(out.trimEnd());
+  }
+
+  return outLines.join("\n");
 }
 
 function stripHtmlComments(content: string): string {
@@ -717,10 +983,52 @@ async function transformFileContent(
   file: FileNode,
   options: { removeComments: boolean; minify: boolean }
 ): Promise<string> {
-  if (!file.isText) return file.content;
-  let text =
-    file.content || (await fsp.readFile(file.path, "utf8").catch(() => "")) || "";
+  if (!file.isText) return "";
+  let text = await fsp.readFile(file.path, "utf8").catch(() => "");
   const ext = file.extension.toLowerCase();
+
+  const isJsLike =
+    ext === ".js" ||
+    ext === ".jsx" ||
+    ext === ".ts" ||
+    ext === ".tsx" ||
+    ext === ".mjs" ||
+    ext === ".cjs";
+
+  if (options.removeComments) {
+    if (isJsLike) {
+      // If we're also minifying, rely on Bun/Terser to remove comments safely.
+      if (!options.minify) {
+        text = stripCommentsGeneric(text);
+      }
+    } else if (
+      ext === ".java" ||
+      ext === ".go" ||
+      ext === ".rs" ||
+      ext === ".php" ||
+      ext === ".c" ||
+      ext === ".cpp" ||
+      ext === ".h" ||
+      ext === ".hpp"
+    ) {
+      text = stripCommentsGeneric(text);
+    } else if (
+      ext === ".py" ||
+      ext === ".rb" ||
+      ext === ".sh" ||
+      ext === ".bash"
+    ) {
+      text = ext === ".py" ? stripHashCommentsPython(text) : stripHashCommentsConservative(text);
+    } else if (
+      ext === ".md" ||
+      ext === ".mdx" ||
+      ext === ".markdown" ||
+      ext === ".html" ||
+      ext === ".htm"
+    ) {
+      text = stripHtmlComments(text);
+    }
+  }
 
   if (options.minify) {
     if (
@@ -732,8 +1040,10 @@ async function transformFileContent(
       ext === ".cjs"
     ) {
       const loader =
-        ext === ".ts" || ext === ".tsx"
+        ext === ".tsx"
           ? "tsx"
+          : ext === ".ts"
+          ? "ts"
           : ext === ".jsx"
           ? "jsx"
           : "js";
@@ -810,40 +1120,6 @@ async function transformFileContent(
         .map(l => l.trimEnd())
         .join("\n");
     }
-  } else if (options.removeComments) {
-    if (
-      ext === ".js" ||
-      ext === ".jsx" ||
-      ext === ".ts" ||
-      ext === ".tsx" ||
-      ext === ".mjs" ||
-      ext === ".cjs" ||
-      ext === ".java" ||
-      ext === ".go" ||
-      ext === ".rs" ||
-      ext === ".php" ||
-      ext === ".c" ||
-      ext === ".cpp" ||
-      ext === ".h" ||
-      ext === ".hpp"
-    ) {
-      text = stripCommentsGeneric(text);
-    } else if (
-      ext === ".py" ||
-      ext === ".rb" ||
-      ext === ".sh" ||
-      ext === ".bash"
-    ) {
-      text = stripHashComments(text);
-    } else if (
-      ext === ".md" ||
-      ext === ".mdx" ||
-      ext === ".markdown" ||
-      ext === ".html" ||
-      ext === ".htm"
-    ) {
-      text = stripHtmlComments(text);
-    }
   }
 
   return text;
@@ -893,7 +1169,8 @@ function buildProjectTreeLines(
     } else {
       // File with size and line count like the HTML version
       const sizeKb = (node.sizeBytes / 1024).toFixed(2);
-      const fileInfo = `(Size: ${sizeKb}kb; Lines: ${node.numLines.toLocaleString()})`;
+      const linesLabel = node.numLines >= 0 ? node.numLines.toLocaleString() : "?";
+      const fileInfo = `(Size: ${sizeKb}kb; Lines: ${linesLabel})`;
       lines.push(`${prefix}${connector}${node.name} ${fileInfo}`);
     }
 
@@ -918,37 +1195,58 @@ async function buildCombinedOutput(
   root: FileNode | null,
   flatFiles: FileNode[],
   selected: Set<string>,
-  options: CombineOptions
+  options: CombineOptions,
+  onProgress?: (info: { index: number; total: number; relPath: string }) => void
 ): Promise<CombinedResult> {
   const selectedFiles = flatFiles
     .filter(f => !f.isDirectory && f.isText && selected.has(f.path))
     .sort((a, b) => a.relPath.localeCompare(b.relPath));
 
   const bodyLines: string[] = [];
+  let bodyBytes = 0;
+  let bodyTokens = 0;
+  let bodyLinesCount = 0;
+
+  const pushLine = (line: string) => {
+    bodyLines.push(line);
+    const len = Buffer.byteLength(line, "utf8");
+    bodyBytes += len + 1; // +1 for newline
+    bodyTokens += countTokens(line);
+    // Rough line count, sufficient for stats
+    let lines = 1;
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] === '\n') lines++;
+    }
+    bodyLinesCount += lines;
+  };
 
   if (options.includePreamble && options.preambleText.trim()) {
-    bodyLines.push(
-      "<preamble>",
-      options.preambleText.trim(),
-      "</preamble>",
-      ""
-    );
+    pushLine("<preamble>");
+    pushLine(options.preambleText.trim());
+    pushLine("</preamble>");
+    pushLine("");
   }
 
   if (options.includeGoal && options.goalText.trim()) {
-    bodyLines.push("<goal>", options.goalText.trim(), "</goal>", "");
+    pushLine("<goal>");
+    pushLine(options.goalText.trim());
+    pushLine("</goal>");
+    pushLine("");
   }
 
   if (root && selectedFiles.length > 0) {
     const treeLines = buildProjectTreeLines(root, selected);
     if (treeLines.length > 0) {
-      bodyLines.push(...treeLines, "");
+      for (const line of treeLines) pushLine(line);
+      pushLine("");
     }
   }
 
-  bodyLines.push("<files>");
+  pushLine("<files>");
 
-  for (const file of selectedFiles) {
+  for (let idx = 0; idx < selectedFiles.length; idx++) {
+    const file = selectedFiles[idx]!;
+    onProgress?.({ index: idx + 1, total: selectedFiles.length, relPath: file.relPath });
     const transformed = await transformFileContent(file, {
       removeComments: options.removeComments,
       minify: options.minify
@@ -960,20 +1258,16 @@ async function buildCombinedOutput(
     const fileTokens = countTokens(content);
     const contentBytes = Buffer.byteLength(content, "utf8");
 
-    bodyLines.push(
-      `<file path="${file.relPath}" lang="${lang}" lines="${numLines}" bytes="${contentBytes}" tokens="${fileTokens}">`,
-      content,
-      "</file>",
-      ""
-    );
+    pushLine(`<file path="${file.relPath}" lang="${lang}" lines="${numLines}" bytes="${contentBytes}" tokens="${fileTokens}">`);
+    pushLine(content);
+    pushLine("</file>");
+    pushLine("");
   }
 
-  bodyLines.push("</files>");
+  pushLine("</files>");
 
-  const bodyText = bodyLines.join("\n");
-  const bodyBytes = Buffer.byteLength(bodyText, "utf8");
-  const bodyTokens = countTokens(bodyText);
-  const bodyLinesCount = bodyText.split(/\r?\n/).length;
+  // Adjust counters for the final join which adds N-1 newlines, not N
+  if (bodyBytes > 0) bodyBytes -= 1; 
 
   const headerLines = [
     "===== SOURCE2PROMPT v2 =====",
@@ -1041,11 +1335,25 @@ async function buildPromptPreviewSnippet(
 
   const previewFiles = selectedFiles.slice(0, 3);
   for (const f of previewFiles) {
-    const transformed = await transformFileContent(f, {
-      removeComments: options.removeComments,
-      minify: options.minify
-    });
-    let snippet = transformed || f.content;
+    let snippet = "";
+    if (f.sizeBytes > MAX_READ_BYTES) {
+      const headBytes = Math.min(64 * 1024, f.sizeBytes);
+      try {
+        const head = await readFileHeadUtf8(f.path, headBytes);
+        const prefix = `// Large file (${formatBytes(f.sizeBytes)}). Sample shows first ${formatBytes(
+          headBytes
+        )}.\n\n`;
+        snippet = prefix + head;
+      } catch {
+        snippet = "// Error reading file";
+      }
+    } else {
+      const transformed = await transformFileContent(f, {
+        removeComments: options.removeComments,
+        minify: options.minify
+      });
+      snippet = transformed || "";
+    }
     const maxLines = 40;
     const maxChars = 1200;
     const parts = snippet.split(/\r?\n/).slice(0, maxLines);
@@ -1074,32 +1382,136 @@ async function buildPromptPreviewSnippet(
 
 /* ---------- Presets & clipboard ---------- */
 
+function validatePreset(p: any): p is Preset {
+  return (
+    typeof p === "object" &&
+    p !== null &&
+    typeof p.name === "string" &&
+    typeof p.rootDir === "string" &&
+    Array.isArray(p.selectedRelPaths)
+  );
+}
+
 function loadPresets(): Preset[] {
   try {
     const raw = fs.readFileSync(PRESET_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed;
-    if (parsed && Array.isArray(parsed.presets)) return parsed.presets;
-    return [];
+    let candidates: any[] = [];
+    if (Array.isArray(parsed)) {
+      candidates = parsed;
+    } else if (parsed && Array.isArray(parsed.presets)) {
+      candidates = parsed.presets;
+    }
+    return candidates.filter(validatePreset);
   } catch {
     return [];
   }
 }
 
-function savePresets(presets: Preset[]) {
+function savePresets(presets: Preset[]): boolean {
   try {
     fs.writeFileSync(PRESET_FILE, JSON.stringify(presets, null, 2), "utf8");
+    return true;
   } catch {
-    // ignore
+    return false;
   }
 }
 
 async function copyToClipboard(text: string): Promise<boolean> {
+  const platform = process.platform;
+  // Encode text once
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+
   try {
-    await clipboardy.write(text);
-    return true;
+    if (platform === "darwin") {
+      const proc = Bun.spawn(["pbcopy"], {
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const writer = proc.stdin.getWriter();
+      await writer.write(data);
+      await writer.close();
+      await proc.exited;
+      return proc.exitCode === 0;
+    }
+
+    if (platform === "linux") {
+      // Try common Linux clipboard utilities in order
+      const candidates = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+      ];
+
+      for (const cmd of candidates) {
+        try {
+          const proc = Bun.spawn(cmd, {
+            stdin: "pipe",
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+          const writer = proc.stdin.getWriter();
+          await writer.write(data);
+          await writer.close();
+          await proc.exited;
+          if (proc.exitCode === 0) return true;
+        } catch {
+          // Continue to next candidate
+        }
+      }
+      return false;
+    }
+
+    if (platform === "win32") {
+      const proc = Bun.spawn(["clip.exe"], {
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const writer = proc.stdin.getWriter();
+      await writer.write(data);
+      await writer.close();
+      await proc.exited;
+      return proc.exitCode === 0;
+    }
+    
+    return false;
   } catch {
     return false;
+  }
+}
+
+function getPreferredEditor(): string {
+  const editor = process.env.VISUAL || process.env.EDITOR;
+  return editor && editor.trim() ? editor.trim() : "vi";
+}
+
+function quoteForShell(arg: string): string {
+  return `"${arg.replace(/"/g, "\\\"")}"`;
+}
+
+async function editTextInExternalEditor(
+  initialText: string,
+  filenameHint: string
+): Promise<{ ok: true; text: string; changed: boolean } | { ok: false; error: string }> {
+  const editor = getPreferredEditor();
+  const safeHint = filenameHint.replace(/[^a-z0-9_-]+/gi, "_");
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "s2p-"));
+  const tmpFile = path.join(tmpDir, `${safeHint}.txt`);
+
+  try {
+    await fsp.writeFile(tmpFile, initialText, "utf8");
+
+    const cmd = `${editor} ${quoteForShell(tmpFile)}`;
+    const res = spawnSync(cmd, { stdio: "inherit", shell: true });
+    if (res.error) return { ok: false, error: res.error.message };
+
+    const updated = await fsp.readFile(tmpFile, "utf8").catch(() => initialText);
+    return { ok: true, text: updated, changed: updated !== initialText };
+  } finally {
+    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -1175,10 +1587,17 @@ function debounce<F extends (...args: any[]) => void>(
 const DEFAULT_PREAMBLE =
   "The following are the complete project code files for my app. Below is a comprehensive collection of the project's source files.";
 
-const App: React.FC = () => {
+interface AppProps {
+  initialRootDir?: string;
+}
+
+const App: React.FC<AppProps> = ({ initialRootDir }) => {
   const { exit } = useApp();
   const { stdout } = useStdout();
-  const [rootDir, setRootDir] = useState(path.resolve(process.cwd()));
+  const { setRawMode, isRawModeSupported } = useStdin();
+  const [rootDir, setRootDir] = useState(
+    initialRootDir ? path.resolve(initialRootDir) : path.resolve(process.cwd())
+  );
 
   const [rootNode, setRootNode] = useState<FileNode | null>(null);
   const [flatFiles, setFlatFiles] = useState<FileNode[]>([]);
@@ -1212,14 +1631,19 @@ const App: React.FC = () => {
   const [statsSizeBytes, setStatsSizeBytes] = useState(0);
   const [statsFileCount, setStatsFileCount] = useState(0);
   const [statsLineCount, setStatsLineCount] = useState(0);
+  const tokenEstimateCacheRef = useRef<Map<string, number>>(new Map());
+  const tokenEstimateRunIdRef = useRef(0);
   const [previewContent, setPreviewContent] = useState("");
   const [previewLang, setPreviewLang] = useState("txt");
+  const [previewScrollOffset, setPreviewScrollOffset] = useState(0);
 
   const [mode, setMode] = useState<Mode>("main");
   const [combined, setCombined] = useState<CombinedResult | null>(null);
   const [exportPath, setExportPath] = useState("combined-prompt.txt");
 
   const [promptPreview, setPromptPreview] = useState("");
+  const [promptSampleCollapsed, setPromptSampleCollapsed] = useState(false);
+  const [promptSampleScrollOffset, setPromptSampleScrollOffset] = useState(0);
 
   // UI state for modals and exit confirmation
   const [showHelp, setShowHelp] = useState(false);
@@ -1228,15 +1652,60 @@ const App: React.FC = () => {
   // Scroll offset for combined view
   const [combinedScrollOffset, setCombinedScrollOffset] = useState(0);
 
+  // Scan ID to handle race conditions
+  const [scanId, setScanId] = useState(0);
+
   const rows = stdout.rows ?? 30;
   const cols = stdout.columns ?? 120;
-  const listHeight = Math.max(8, rows - 16);
+
+  const promptSampleHeightExpanded = Math.min(10, Math.max(6, Math.floor(rows * 0.22)));
+  const promptSampleHeight = promptSampleCollapsed ? 3 : promptSampleHeightExpanded;
+  const promptSampleCodeHeight = Math.max(1, promptSampleHeight - 3);
+
+  const chromeHeight = 3 + 2 + 2 + promptSampleHeight + 6;
+  const listHeight = Math.max(6, rows - chromeHeight);
+  const previewCodeHeight = Math.max(5, listHeight - 6);
+
+  const previewLines = useMemo(
+    () => (previewContent ? previewContent.split(/\r?\n/) : []),
+    [previewContent]
+  );
+  const previewMaxScroll = Math.max(0, previewLines.length - previewCodeHeight);
+  const previewWindowText = useMemo(
+    () => previewLines.slice(previewScrollOffset, previewScrollOffset + previewCodeHeight).join("\n"),
+    [previewLines, previewScrollOffset, previewCodeHeight]
+  );
+
+  useEffect(() => {
+    if (previewScrollOffset > previewMaxScroll) {
+      setPreviewScrollOffset(previewMaxScroll);
+    }
+  }, [previewScrollOffset, previewMaxScroll]);
+
+  const promptPreviewLines = useMemo(
+    () => (promptPreview ? promptPreview.split(/\r?\n/) : []),
+    [promptPreview]
+  );
+  const promptSampleMaxScroll = promptSampleCollapsed
+    ? 0
+    : Math.max(0, promptPreviewLines.length - promptSampleCodeHeight);
+
+  useEffect(() => {
+    if (promptSampleScrollOffset > promptSampleMaxScroll) {
+      setPromptSampleScrollOffset(promptSampleMaxScroll);
+    }
+  }, [promptSampleScrollOffset, promptSampleMaxScroll]);
 
   const handleScan = async (
     dir: string
   ): Promise<{ root: FileNode | null; files: FileNode[] }> => {
     const resolved = path.resolve(dir);
     setRootDir(resolved);
+    
+    // Increment scan ID to invalidate previous scans
+    const currentScanId = scanId + 1;
+    setScanId(currentScanId);
+
     setLoading(true);
     setScanError(null);
     setStatus("Scanning project...");
@@ -1247,15 +1716,34 @@ const App: React.FC = () => {
     setSelected(new Set());
     setCursor(0);
     setScrollOffset(0);
+    tokenEstimateCacheRef.current.clear();
 
     try {
       const result = await scanProject(resolved, info => {
-        setProgressText(
-          info.currentPath
-            ? `Scanning ${info.currentPath} (${info.processedFiles} files)...`
-            : `Scanning... (${info.processedFiles} files)`
-        );
+        // Only update progress if this is the active scan
+        setScanId(prev => {
+           if (prev === currentScanId) {
+             setProgressText(
+                info.currentPath
+                  ? `Scanning ${info.currentPath} (${info.processedFiles} files)...`
+                  : `Scanning... (${info.processedFiles} files)`
+              );
+           }
+           return prev;
+        });
       });
+      
+      // Check if this scan is still the latest
+      let isLatest = false;
+      setScanId(prev => {
+        isLatest = (prev === currentScanId);
+        return prev;
+      });
+
+      if (!isLatest) {
+        return { root: null, files: [] };
+      }
+
       setRootNode(result.root);
       setFlatFiles(result.flatFiles);
       setExpanded(new Set([result.root.path]));
@@ -1264,10 +1752,19 @@ const App: React.FC = () => {
       setProgressText(null);
       return { root: result.root, files: result.flatFiles };
     } catch (err: any) {
-      setScanError(err?.message || String(err));
-      setStatus("Scan error");
-      setLoading(false);
-      setProgressText(null);
+      // Check if this scan is still the latest
+      let isLatest = false;
+      setScanId(prev => {
+        isLatest = (prev === currentScanId);
+        return prev;
+      });
+      
+      if (isLatest) {
+        setScanError(err?.message || String(err));
+        setStatus("Scan error");
+        setLoading(false);
+        setProgressText(null);
+      }
       return { root: null, files: [] };
     }
   };
@@ -1322,11 +1819,7 @@ const App: React.FC = () => {
       debounce(
         (
           files: FileNode[],
-          selectedSet: Set<string>,
-          includePreamble: boolean,
-          preambleText: string,
-          includeGoal: boolean,
-          goalText: string
+          selectedSet: Set<string>
         ) => {
           const selectedFiles = files.filter(
             f => !f.isDirectory && f.isText && selectedSet.has(f.path)
@@ -1335,27 +1828,11 @@ const App: React.FC = () => {
             (acc, f) => acc + f.sizeBytes,
             0
           );
-          const lines = selectedFiles.reduce(
-            (acc, f) => acc + f.numLines,
-            0
-          );
-
-          const tokensFromFiles = selectedFiles.reduce((acc, f) => {
-            if (f.content) return acc + countTokens(f.content);
-            const approx = Math.ceil(f.sizeBytes / 4);
-            return acc + approx;
-          }, 0);
-
-          const paramTokens =
-            (includePreamble ? countTokens(preambleText) : 0) +
-            (includeGoal ? countTokens(goalText) : 0);
-
-          const totalTokens = tokensFromFiles + paramTokens;
+          const lines = selectedFiles.reduce((acc, f) => acc + Math.max(0, f.numLines), 0);
 
           setStatsFileCount(selectedFiles.length);
           setStatsSizeBytes(size);
           setStatsLineCount(lines);
-          setStatsTokens(totalTokens);
         },
         200
       ),
@@ -1363,44 +1840,181 @@ const App: React.FC = () => {
   );
 
   useEffect(() => {
-    debouncedStats(
-      flatFiles,
-      selected,
-      includePreamble,
-      preamble,
-      includeGoal,
-      goal
-    );
-  }, [flatFiles, selected, includePreamble, preamble, includeGoal, goal, debouncedStats]);
+    debouncedStats(flatFiles, selected);
+  }, [flatFiles, selected, debouncedStats]);
+
+  useEffect(() => {
+    const runId = ++tokenEstimateRunIdRef.current;
+    let cancelled = false;
+
+    const timer = setTimeout(() => {
+      (async () => {
+        const selectedFiles = flatFiles.filter(
+          f => !f.isDirectory && f.isText && selected.has(f.path)
+        );
+
+        const baseTokens =
+          (includePreamble ? countTokens(preamble) : 0) +
+          (includeGoal ? countTokens(goal) : 0);
+
+        const needsTransform = removeComments || minify;
+        const cache = tokenEstimateCacheRef.current;
+
+        let totalTokens = baseTokens;
+        const toCompute: FileNode[] = [];
+        const fallbackTokensByKey = new Map<string, number>();
+
+        for (const f of selectedFiles) {
+          if (!needsTransform || f.sizeBytes > MAX_READ_BYTES) {
+            if (f.tokens !== undefined) totalTokens += f.tokens;
+            else totalTokens += Math.ceil(f.sizeBytes / 4);
+            continue;
+          }
+
+          const key = `${f.path}|rc=${removeComments ? 1 : 0}|m=${minify ? 1 : 0}`;
+          const cached = cache.get(key);
+          if (cached !== undefined) {
+            totalTokens += cached;
+          } else {
+            // Conservative fallback until we compute transformed tokens.
+            const fallback = f.tokens !== undefined ? f.tokens : Math.ceil(f.sizeBytes / 4);
+            totalTokens += fallback;
+            fallbackTokensByKey.set(key, fallback);
+            toCompute.push(f);
+          }
+        }
+
+        if (cancelled || runId !== tokenEstimateRunIdRef.current) return;
+        setStatsTokens(totalTokens);
+
+        if (!needsTransform || toCompute.length === 0) return;
+
+        for (let i = 0; i < toCompute.length; i++) {
+          const f = toCompute[i];
+          if (cancelled || runId !== tokenEstimateRunIdRef.current) return;
+
+          const key = `${f.path}|rc=${removeComments ? 1 : 0}|m=${minify ? 1 : 0}`;
+          const fallback = fallbackTokensByKey.get(key) ?? 0;
+          const existingCached = cache.get(key);
+          if (existingCached !== undefined) {
+            totalTokens += existingCached - fallback;
+            fallbackTokensByKey.delete(key);
+            continue;
+          }
+
+          try {
+            const transformed = await transformFileContent(f, {
+              removeComments,
+              minify
+            });
+            const nextTokens = countTokens(transformed);
+            cache.set(key, nextTokens);
+            totalTokens += nextTokens - fallback;
+            fallbackTokensByKey.delete(key);
+          } catch {
+            // Keep fallback (raw/approx) if transform fails
+          }
+
+          // Yield occasionally to keep the UI responsive on large selections.
+          if (i % 5 === 4 && !cancelled && runId === tokenEstimateRunIdRef.current) {
+            setStatsTokens(totalTokens);
+          }
+          if (i % 3 === 2) await new Promise(r => setTimeout(r, 0));
+        }
+
+        if (cancelled || runId !== tokenEstimateRunIdRef.current) return;
+        setStatsTokens(totalTokens);
+      })().catch(() => {
+        if (!cancelled && runId === tokenEstimateRunIdRef.current) {
+          // Fall back to a safe approximation if the background computation fails
+          const selectedFiles = flatFiles.filter(
+            f => !f.isDirectory && f.isText && selected.has(f.path)
+          );
+          const baseTokens =
+            (includePreamble ? countTokens(preamble) : 0) +
+            (includeGoal ? countTokens(goal) : 0);
+          const approxTokens = selectedFiles.reduce((acc, f) => {
+            if (f.tokens !== undefined) return acc + f.tokens;
+            return acc + Math.ceil(f.sizeBytes / 4);
+          }, baseTokens);
+          setStatsTokens(approxTokens);
+        }
+      });
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    flatFiles,
+    selected,
+    includePreamble,
+    preamble,
+    includeGoal,
+    goal,
+    removeComments,
+    minify
+  ]);
 
   useEffect(() => {
     const node = visibleNodes[cursor];
+    let cancelled = false;
     if (!node || node.isDirectory || !node.isText) {
       setPreviewContent("");
       setPreviewLang("txt");
-      return;
+      setPreviewScrollOffset(0);
+      return () => {
+        cancelled = true;
+      };
     }
     const lang = languageFromExtension(node.extension);
     setPreviewLang(lang);
+    setPreviewScrollOffset(0);
 
-    if (node.content) {
-      setPreviewContent(
-        node.content.length > MAX_PREVIEW_CHARS
-          ? node.content.slice(0, MAX_PREVIEW_CHARS)
-          : node.content
-      );
-    } else if (node.isText) {
-      fsp
-        .readFile(node.path, "utf8")
-        .then(content =>
-          setPreviewContent(
-            content.length > MAX_PREVIEW_CHARS
-              ? content.slice(0, MAX_PREVIEW_CHARS)
-              : content
-          )
-        )
-        .catch(() => setPreviewContent("// Error reading file"));
+    if (node.isText) {
+      if (node.sizeBytes > MAX_READ_BYTES) {
+        const headBytes = Math.min(64 * 1024, node.sizeBytes);
+        setPreviewContent(
+          `// Large file (${formatBytes(node.sizeBytes)}). Loading preview...`
+        );
+        readFileHeadUtf8(node.path, headBytes)
+          .then(head => {
+            if (cancelled) return;
+            const prefix = `// Large file (${formatBytes(node.sizeBytes)}). Showing first ${formatBytes(
+              headBytes
+            )}.\n\n`;
+            const combined = prefix + head;
+            setPreviewContent(
+              combined.length > MAX_PREVIEW_CHARS
+                ? combined.slice(0, MAX_PREVIEW_CHARS) + "\n..."
+                : combined
+            );
+          })
+          .catch(() => {
+            if (!cancelled) setPreviewContent("// Error reading file");
+          });
+      } else {
+        setPreviewContent("// Loading preview...");
+        fsp
+          .readFile(node.path, "utf8")
+          .then(content => {
+            if (cancelled) return;
+            setPreviewContent(
+              content.length > MAX_PREVIEW_CHARS
+                ? content.slice(0, MAX_PREVIEW_CHARS)
+                : content
+            );
+          })
+          .catch(() => {
+            if (!cancelled) setPreviewContent("// Error reading file");
+          });
+      }
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [visibleNodes, cursor]);
 
   useEffect(() => {
@@ -1440,40 +2054,55 @@ const App: React.FC = () => {
     };
   }, [rootNode, flatFiles, selected, includePreamble, preamble, includeGoal, goal, removeComments, minify]);
 
-  const toggleSelectNode = (node: FileNode) => {
-    if (node.isDirectory && !filter.trim()) {
-      const descendants: FileNode[] = [];
-      const collectDesc = (n: FileNode) => {
-        if (!n.isDirectory && n.isText) descendants.push(n);
-        if (n.children) for (const c of n.children) collectDesc(c);
-      };
-      collectDesc(node);
-      const newSel = new Set(selected);
-      const allSelected = descendants.every(d => newSel.has(d.path));
-      if (allSelected) {
-        for (const d of descendants) newSel.delete(d.path);
-      } else {
-        for (const d of descendants) newSel.add(d.path);
-      }
-      setSelected(newSel);
-      setStatus(
-        `${allSelected ? "Deselected" : "Selected"} ${descendants.length} files in "${node.relPath}"`
-      );
-      return;
-    }
-
-    if (!node.isDirectory) {
-      if (!node.isText) {
-        setStatus("File is binary or too large to include.");
-        return;
-      }
-      const newSel = new Set(selected);
-      if (newSel.has(node.path)) newSel.delete(node.path);
-      else newSel.add(node.path);
-      setSelected(newSel);
-    }
-  };
-
+	    const toggleSelectNode = (node: FileNode) => {
+	      if (node.isDirectory) {
+	        const descendants: FileNode[] = [];
+	        const collectDesc = (n: FileNode) => {
+	          if (isSelectableTextNode(n)) descendants.push(n);
+	          if (n.children) for (const c of n.children) collectDesc(c);
+	        };
+	        collectDesc(node);
+	        if (descendants.length === 0) {
+	          setStatus(`No selectable text files in "${node.relPath}".`);
+	          return;
+	        }
+	        const newSel = new Set(selected);
+	        const allSelected = descendants.every(d => newSel.has(d.path));
+	        if (allSelected) {
+	          for (const d of descendants) newSel.delete(d.path);
+	        } else {
+	          for (const d of descendants) newSel.add(d.path);
+	        }
+	        setSelected(newSel);
+	        setStatus(
+	          `${allSelected ? "Deselected" : "Selected"} ${descendants.length} files in "${node.relPath}"`
+	        );
+	        return;
+	      }
+	  
+	      // It's a file
+	      if (!node.isText) {
+	        setStatus("File is binary and cannot be included.");
+	        return;
+	      }
+	      if (!isSelectableTextNode(node)) {
+	        setStatus(
+	          `File too large to include (>${formatBytes(MAX_INCLUDE_BYTES)}): ${node.relPath}`
+	        );
+	        return;
+	      }
+	      const newSel = new Set(selected);
+	      const wasSelected = newSel.has(node.path);
+	      if (wasSelected) newSel.delete(node.path);
+	      else newSel.add(node.path);
+	      setSelected(newSel);
+	  
+	      if (!wasSelected && node.sizeBytes > MAX_READ_BYTES) {
+	        setStatus(
+	          `Selected large file (${formatBytes(node.sizeBytes)}). Generation may be slower.`
+	        );
+	      }
+	    };
   const moveCursor = (delta: number) => {
     if (!visibleNodes.length) return;
     const maxIndex = visibleNodes.length - 1;
@@ -1483,11 +2112,11 @@ const App: React.FC = () => {
     setCursor(next);
   };
 
-  const toggleQuickSelect = (key: QuickSelectKey) => {
-    if (!flatFiles.length) return;
-    const matches = filterFilesByQuickSelect(flatFiles, key).filter(
-      f => f.isText
-    );
+	  const toggleQuickSelect = (key: QuickSelectKey) => {
+	    if (!flatFiles.length) return;
+	    const matches = filterFilesByQuickSelect(flatFiles, key).filter(
+	      f => isSelectableTextNode(f)
+	    );
     if (!matches.length) {
       setStatus("No matching files for this quick select.");
       return;
@@ -1504,17 +2133,49 @@ const App: React.FC = () => {
     setStatus(QUICK_SELECT_LABELS[key]);
   };
 
-  const clearSelectionInFilter = () => {
-    if (!filter.trim()) return;
-    const q = filter.trim().toLowerCase();
-    const inFilter = flatFiles.filter(f =>
-      f.relPath.toLowerCase().includes(q)
-    );
-    if (!inFilter.length) return;
-    const newSel = new Set(selected);
-    for (const f of inFilter) newSel.delete(f.path);
+	  const clearSelectionInFilter = () => {
+	    if (!filter.trim()) return;
+	    const q = filter.trim().toLowerCase();
+	    const inFilter = flatFiles.filter(
+	      f => isSelectableTextNode(f) && f.relPath.toLowerCase().includes(q)
+	    );
+	    if (!inFilter.length) return;
+	    const newSel = new Set(selected);
+	    for (const f of inFilter) newSel.delete(f.path);
     setSelected(newSel);
     setStatus("Cleared selections for files matching current filter.");
+  };
+
+  const updateSelectionInFilter = (action: "select" | "deselect") => {
+    if (!filter.trim()) {
+      setStatus("No active filter.");
+      return;
+	    }
+	    const q = filter.trim().toLowerCase();
+	    const matches = flatFiles.filter(
+	      f => isSelectableTextNode(f) && f.relPath.toLowerCase().includes(q)
+	    );
+    if (!matches.length) {
+      setStatus("No files match current filter.");
+      return;
+    }
+
+    const newSel = new Set(selected);
+    let changed = 0;
+    for (const f of matches) {
+      if (action === "select") {
+        if (!newSel.has(f.path)) {
+          newSel.add(f.path);
+          changed++;
+        }
+      } else {
+        if (newSel.delete(f.path)) changed++;
+      }
+    }
+    setSelected(newSel);
+    setStatus(
+      `${action === "select" ? "Selected" : "Deselected"} ${changed} file(s) matching current filter.`
+    );
   };
 
   const handleSavePreset = () => {
@@ -1546,9 +2207,12 @@ const App: React.FC = () => {
       a.name.localeCompare(b.name)
     );
     setPresets(next);
-    savePresets(next);
-    setPresetName("");
-    setStatus(`Saved preset "${name}".`);
+    if (savePresets(next)) {
+      setPresetName("");
+      setStatus(`Saved preset "${name}".`);
+    } else {
+      setStatus(`Error saving preset "${name}" to disk.`);
+    }
   };
 
   const handleLoadPreset = (index: number) => {
@@ -1574,7 +2238,7 @@ const App: React.FC = () => {
         for (const rel of preset.selectedRelPaths) {
           const abs = path.join(base, rel);
           const node = files.find(f => f.path === abs);
-          if (node && node.isText) newSel.add(abs);
+          if (node && isSelectableTextNode(node)) newSel.add(abs);
         }
         setSelected(newSel);
         setStatus(
@@ -1587,7 +2251,7 @@ const App: React.FC = () => {
       for (const rel of preset.selectedRelPaths) {
         const abs = path.join(base, rel);
         const node = flatFiles.find(f => f.path === abs);
-        if (node && node.isText) newSel.add(abs);
+        if (node && isSelectableTextNode(node)) newSel.add(abs);
       }
       setSelected(newSel);
       setStatus(
@@ -1601,11 +2265,14 @@ const App: React.FC = () => {
     if (!preset) return;
     const next = presets.filter((_, i) => i !== index);
     setPresets(next);
-    savePresets(next);
+    if (savePresets(next)) {
+      setStatus(`Deleted preset "${preset.name}".`);
+    } else {
+      setStatus(`Deleted preset "${preset.name}" (memory only; save failed).`);
+    }
     setSelectedPresetIndex(prev =>
       prev >= next.length ? Math.max(0, next.length - 1) : prev
     );
-    setStatus(`Deleted preset "${preset.name}".`);
   };
 
   const handleGenerate = async () => {
@@ -1629,19 +2296,28 @@ const App: React.FC = () => {
         removeComments,
         minify
       };
+      let lastProgressAt = 0;
+      let lastProgressIndex = 0;
       const result = await buildCombinedOutput(
         rootNode,
         flatFiles,
         selected,
-        options
+        options,
+        info => {
+          const now = Date.now();
+          if (info.index === lastProgressIndex) return;
+          if (now - lastProgressAt < 120 && info.index !== info.total) return;
+          lastProgressAt = now;
+          lastProgressIndex = info.index;
+          setStatus(`Generating (${info.index}/${info.total}): ${info.relPath}`);
+        }
       );
       setCombined(result);
-      const copied = await copyToClipboard(result.text);
       setMode("combined");
       setStatus(
-        `${copied ? "Copied to clipboard" : "Generated"}: ${formatBytes(
+        `Generated: ${formatBytes(
           result.bytes
-        )}, ~${result.tokens.toLocaleString()} tokens.`
+        )}, ~${result.tokens.toLocaleString()} tokens. Press Y to copy.`
       );
     } catch (err: any) {
       setStatus(err?.message || String(err));
@@ -1662,10 +2338,74 @@ const App: React.FC = () => {
     }
   };
 
+  const openEditorForField = async (field: "preamble" | "goal") => {
+    const currentText = field === "preamble" ? preamble : goal;
+    const editor = getPreferredEditor();
+    setConfirmExit(false);
+    setFocusField("none");
+    setStatus(`Opening ${field} in ${editor}...`);
+
+    const clearScreen = () => {
+      try {
+        stdout.write("\x1b[2J\x1b[H");
+      } catch {
+        // ignore
+      }
+    };
+
+    try {
+      if (isRawModeSupported) {
+        try {
+          setRawMode(false);
+        } catch {
+          // ignore
+        }
+      }
+      clearScreen();
+
+      const result = await editTextInExternalEditor(currentText, `s2p-${field}`);
+      clearScreen();
+
+      if (!result.ok) {
+        setStatus(`Editor error: ${result.error}`);
+        return;
+      }
+
+      if (!result.changed) {
+        setStatus(`No changes to ${field}.`);
+        return;
+      }
+
+      if (field === "preamble") setPreamble(result.text);
+      else setGoal(result.text);
+      setStatus(`Updated ${field}.`);
+    } finally {
+      if (isRawModeSupported) {
+        try {
+          setRawMode(true);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  };
+
   useInput((input, key) => {
     // Force quit with Ctrl+C
     if (key.ctrl && input === "c") {
       exit();
+      return;
+    }
+
+    // ? toggles help (reliable across terminals). When help is open, ? closes it.
+    if (input === "?" && showHelp) {
+      setShowHelp(false);
+      setConfirmExit(false);
+      return;
+    }
+    if (input === "?" && focusField === "none") {
+      setShowHelp(prev => !prev);
+      setConfirmExit(false);
       return;
     }
 
@@ -1678,7 +2418,7 @@ const App: React.FC = () => {
 
     // If help modal is shown, Esc or F1 closes it
     if (showHelp) {
-      if (key.escape || input === "\x1bOP" || input === "\x1b[11~") {
+      if (key.escape || input === "?" || input === "\x1bOP" || input === "\x1b[11~") {
         setShowHelp(false);
       }
       return;
@@ -1701,6 +2441,17 @@ const App: React.FC = () => {
       setConfirmExit(false);
       setStatus("Exit cancelled.");
       // Don't return - continue processing the key
+    }
+
+    if (key.ctrl && input.toLowerCase() === "e" && mode === "main") {
+      if (focusField === "preamble" || focusField === "goal") {
+        void openEditorForField(focusField);
+        return;
+      }
+      if (activePane === "config" && configTab === "inputs") {
+        void openEditorForField("preamble");
+        return;
+      }
     }
 
     if (mode === "combined") {
@@ -1810,10 +2561,21 @@ const App: React.FC = () => {
     }
 
     if (key.tab) {
-      const panes: Pane[] = ["explorer", "config", "preview"];
+      const panes: Pane[] = ["explorer", "config", "preview", "sample"];
       const idx = panes.indexOf(activePane);
       const next = panes[(idx + 1) % panes.length];
       setActivePane(next);
+      return;
+    }
+
+    if (input === "z") {
+      const next = !promptSampleCollapsed;
+      setPromptSampleCollapsed(next);
+      setStatus(
+        next
+          ? "Prompt sample collapsed. Press z to expand."
+          : "Prompt sample expanded. Press z to collapse."
+      );
       return;
     }
 
@@ -1879,6 +2641,16 @@ const App: React.FC = () => {
 
       if (input.toLowerCase() === "u") {
         clearSelectionInFilter();
+        return;
+      }
+
+      if (input === "a") {
+        updateSelectionInFilter("select");
+        return;
+      }
+
+      if (input === "A") {
+        updateSelectionInFilter("deselect");
         return;
       }
 
@@ -2003,6 +2775,65 @@ const App: React.FC = () => {
         }
       }
     }
+
+    if (activePane === "preview") {
+      if (!previewLines.length) return;
+
+      if (key.upArrow || input === "k") {
+        setPreviewScrollOffset(prev => Math.max(0, prev - 1));
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setPreviewScrollOffset(prev => Math.min(previewMaxScroll, prev + 1));
+        return;
+      }
+      if (key.pageUp || input === "b") {
+        setPreviewScrollOffset(prev => Math.max(0, prev - previewCodeHeight));
+        return;
+      }
+      if (key.pageDown || input === " ") {
+        setPreviewScrollOffset(prev => Math.min(previewMaxScroll, prev + previewCodeHeight));
+        return;
+      }
+      if (input === "g") {
+        setPreviewScrollOffset(0);
+        return;
+      }
+      if (input === "G") {
+        setPreviewScrollOffset(previewMaxScroll);
+        return;
+      }
+    }
+
+    if (activePane === "sample") {
+      if (promptSampleCollapsed) return;
+      if (!promptPreviewLines.length) return;
+
+      if (key.upArrow || input === "k") {
+        setPromptSampleScrollOffset(prev => Math.max(0, prev - 1));
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setPromptSampleScrollOffset(prev => Math.min(promptSampleMaxScroll, prev + 1));
+        return;
+      }
+      if (key.pageUp || input === "b") {
+        setPromptSampleScrollOffset(prev => Math.max(0, prev - promptSampleCodeHeight));
+        return;
+      }
+      if (key.pageDown || input === " ") {
+        setPromptSampleScrollOffset(prev => Math.min(promptSampleMaxScroll, prev + promptSampleCodeHeight));
+        return;
+      }
+      if (input === "g") {
+        setPromptSampleScrollOffset(0);
+        return;
+      }
+      if (input === "G") {
+        setPromptSampleScrollOffset(promptSampleMaxScroll);
+        return;
+      }
+    }
   });
 
   const cost = (statsTokens / 1_000_000) * COST_PER_1M_TOKENS;
@@ -2057,10 +2888,13 @@ const App: React.FC = () => {
             scrollOffset={combinedScrollOffset}
             showScrollbar={combinedLines.length > combinedViewHeight}
             accentColor="cyan"
+            totalItems={combinedLines.length}
           >
-            {combinedLines.map((line, idx) => (
-              <Text key={idx}>{line || " "}</Text>
-            ))}
+            {combinedLines
+              .slice(combinedScrollOffset, combinedScrollOffset + combinedViewHeight)
+              .map((line, idx) => (
+                <Text key={idx}>{line || " "}</Text>
+              ))}
           </ScrollableBox>
         </Box>
         <Box
@@ -2192,49 +3026,65 @@ const App: React.FC = () => {
                   scrollOffset={scrollOffset}
                   showScrollbar={visibleNodes.length > listHeight}
                   accentColor="cyan"
+                  totalItems={visibleNodes.length}
                 >
-                  {visibleNodes.map((node, idx) => {
-                    const isCursor = idx === cursor;
-                    const isSel = selected.has(node.path);
-                    const marker = isCursor ? ">" : " ";
-                    const indent = filter.trim() ? 0 : node.depth;
-                    const icon = node.isDirectory
-                      ? expanded.has(node.path)
-                        ? "[-]"
-                        : "[+]"
-                      : isSel
-                      ? "[x]"
-                      : node.isText
-                      ? "[ ]"
-                      : "[!]";
-
-                    let color: any = node.isDirectory
-                      ? "yellow"
-                      : node.isText
-                      ? isSel
-                        ? "green"
-                        : "white"
-                      : "red";
-
-                    if (isCursor) color = "cyan";
-
-                    return (
-                      <Box key={node.path}>
-                        <Text color={isCursor ? "cyan" : "gray"}>{marker}</Text>
-                        <Text dimColor>{" ".repeat(indent)}</Text>
-                        <Text color={color}>
-                          {icon}{" "}
-                          {node.relPath === "." ? node.name : node.relPath}{" "}
-                          {!node.isDirectory &&
-                            `(${formatBytes(node.sizeBytes)}${
-                              node.isText
-                                ? ` | ${node.numLines.toLocaleString()} lines`
-                                : ", binary"
-                            })`}
-                        </Text>
-                      </Box>
-                    );
-                  })}
+	                  {visibleNodes
+	                    .slice(scrollOffset, scrollOffset + listHeight)
+	                    .map((node, sliceIdx) => {
+	                      const globalIdx = scrollOffset + sliceIdx;
+	                      const isCursor = globalIdx === cursor;
+	                      const isSel = selected.has(node.path);
+	                      const marker = isCursor ? ">" : " ";
+	                      const indent = filter.trim() ? 0 : node.depth;
+	                      const isLargeText = isLargeTextNode(node);
+	                      const isTooLarge =
+	                        !node.isDirectory && node.isText && node.sizeBytes > MAX_INCLUDE_BYTES;
+	                      const icon = node.isDirectory
+	                        ? expanded.has(node.path)
+	                          ? "[-]"
+	                          : "[+]"
+	                        : isSel
+	                        ? "[x]"
+	                        : node.isText
+	                        ? isTooLarge
+	                          ? "[!]"
+	                          : isLargeText
+	                          ? "[~]"
+	                          : "[ ]"
+	                        : "[!]";
+	
+	                      let color: any = node.isDirectory
+	                        ? "yellow"
+	                        : node.isText
+	                        ? isSel
+	                          ? "green"
+	                          : isTooLarge
+	                          ? "yellow"
+	                          : isLargeText
+	                          ? "cyan"
+	                          : "white"
+	                        : "red";
+	
+	                      if (isCursor) color = "cyan";
+	                      const lineCountLabel =
+	                        node.numLines >= 0 ? node.numLines.toLocaleString() : "?";
+	                      const label =
+	                        filter.trim() && node.relPath !== "." ? node.relPath : node.name;
+	
+	                      return (
+	                        <Box key={node.path}>
+	                          <Text color={isCursor ? "cyan" : "gray"}>{marker}</Text>
+	                          <Text dimColor>{" ".repeat(indent)}</Text>
+	                          <Text color={color}>
+	                            {icon} {label}{" "}
+	                            {!node.isDirectory &&
+	                              `(${formatBytes(node.sizeBytes)}${
+	                                node.isText ? ` | ${lineCountLabel} lines` : ", binary"
+	                              })`}
+	                          </Text>
+	                        </Box>
+	                      );
+	                    })}
                 </ScrollableBox>
               )}
             </Box>
@@ -2315,7 +3165,7 @@ const App: React.FC = () => {
 
                 <Box marginTop={1}>
                   <Text dimColor>
-                    [P] Edit preamble  [G] Edit goal (while in Inputs tab)
+                    [P] Focus preamble  [G] Focus goal  [Ctrl+E] $EDITOR (multiline)
                   </Text>
                 </Box>
               </Box>
@@ -2413,14 +3263,24 @@ const App: React.FC = () => {
               borderStyle="single"
               borderColor="gray"
               paddingX={1}
+              justifyContent="space-between"
             >
               <Text bold>FILE PREVIEW</Text>
+              {previewLines.length > 0 && (
+                <Text dimColor>
+                  Ln {previewScrollOffset + 1}-
+                  {Math.min(previewScrollOffset + previewCodeHeight, previewLines.length)} /{" "}
+                  {previewLines.length}
+                </Text>
+              )}
             </Box>
             <Box flexGrow={1} paddingX={1}>
               <SyntaxHighlight
                 language={previewLang}
                 code={
-                  previewContent ||
+                  previewContent
+                    ? previewWindowText
+                    :
                   "// Select a text file to preview (or press Ctrl+G to generate)."
                 }
               />
@@ -2469,18 +3329,52 @@ const App: React.FC = () => {
         <Box
           borderTop
           borderStyle="single"
-          borderColor="gray"
+          borderColor={activePane === "sample" ? "cyan" : "gray"}
           flexDirection="column"
           padding={1}
+          height={promptSampleHeight}
         >
-          <Text bold>PROMPT SAMPLE</Text>
-          <Text dimColor>
-            Live preview of the first part of the combined prompt, based on your current
-            selections and options.
-          </Text>
-          <Box marginTop={1}>
-            <SyntaxHighlight language="txt" code={promptPreview} />
+          <Box justifyContent="space-between">
+            <Text bold>PROMPT SAMPLE</Text>
+            {promptSampleCollapsed ? (
+              <Text dimColor>collapsed (z)</Text>
+            ) : promptPreviewLines.length > 0 ? (
+              <Text dimColor>
+                Ln {promptSampleScrollOffset + 1}-
+                {Math.min(
+                  promptSampleScrollOffset + promptSampleCodeHeight,
+                  promptPreviewLines.length
+                )}{" "}
+                / {promptPreviewLines.length}
+              </Text>
+            ) : (
+              <Text dimColor>empty</Text>
+            )}
           </Box>
+
+          {promptSampleCollapsed ? (
+            <Text dimColor>
+              Collapsed. Press z to expand. (Tab to focus pane)
+            </Text>
+          ) : (
+            <>
+              <Text dimColor>
+                Live preview of the first part of the combined prompt. (z to collapse)
+              </Text>
+              <Box marginTop={1}>
+                <ScrollableBox
+                  height={promptSampleCodeHeight}
+                  scrollOffset={promptSampleScrollOffset}
+                  showScrollbar={promptPreviewLines.length > promptSampleCodeHeight}
+                  accentColor="magenta"
+                >
+                  {promptPreviewLines.map((line, idx) => (
+                    <Text key={idx}>{line || " "}</Text>
+                  ))}
+                </ScrollableBox>
+              </Box>
+            </>
+          )}
         </Box>
       </Box>
 
@@ -2494,10 +3388,10 @@ const App: React.FC = () => {
       >
         <Box flexDirection="column">
           <Text dimColor>
-            F1: Help | Tab: Panes | Explorer: j/k, h/l, Space/Enter, / filter, D root, T/1-9/0/R quick select
+            F1/?: Help | Tab: Panes | Explorer: j/k, h/l, Space/Enter, / filter, D root, T/1-9/0/R quick select
           </Text>
           <Text dimColor>
-            Config: arrows, P/G/I/O/X/M, S/L/D | Ctrl+G: Generate | Esc: Quit (2x)
+            Config: arrows, P/G/I/O/X/M, S/L/D, Ctrl+E: $EDITOR | Sample: z, j/k | Ctrl+G: Generate | Esc: Quit (2x)
           </Text>
         </Box>
         <Box alignItems="flex-end">
@@ -2522,4 +3416,27 @@ const App: React.FC = () => {
   );
 };
 
-render(<App />);
+const args = process.argv.slice(2);
+
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(`
+source2prompt-tui (s2p) - A TUI for combining source code into LLM prompts.
+
+Usage:
+  s2p [directory]
+
+Options:
+  -h, --help    Show this help message
+
+Controls:
+  Explorer:     j/k (move), h/l (collapse/expand), Space (select)
+  Help:         ? or F1
+  Generate:     Ctrl+G
+  Quit:         Esc (twice) or Ctrl+C
+`);
+  process.exit(0);
+}
+
+const rootDirArg = args[0];
+const { waitUntilExit } = render(<App initialRootDir={rootDirArg} />);
+await waitUntilExit();
