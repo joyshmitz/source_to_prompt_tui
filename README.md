@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/source_to_prompt_
 
 ## Highlights
 
-- **Zero-setup binaries**: Installer downloads pre-built binaries for your platform; falls back to Bun source build automatically.
+- **Zero-setup binaries**: Installer downloads pre-built macOS/Linux/Windows binaries; other platforms can build from source automatically (requires git + Bun).
 - **Tree file explorer**: Navigate your project with vim-style keys (j/k/h/l), expand/collapse directories, filter by path. Each file shows its size and line count.
 - **Quick file-type selects**: Press `t` for all text files, or `1-9,0,r` for JS/React/TS/JSON/MD/Python/Go/Java/Ruby/PHP/Rust.
 - **Live syntax preview**: See file contents with syntax highlighting as you navigate.
@@ -90,28 +90,35 @@ s2p solves all of these problems:
 ## Quickstart
 
 ```bash
-# Install via one-liner (recommended)
+# Install via one-liner (recommended; macOS/Linux and Windows via Git Bash/WSL)
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/source_to_prompt_tui/main/install.sh | bash
+
+# Windows (PowerShell)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dicklesworthstone/source_to_prompt_tui/main/install.ps1 | iex"
 
 # Or install with specific options
 curl -fsSL ... | bash -s -- --dest /usr/local/bin --verify
 
-# Or with Bun directly (if you have Bun installed)
-bun install -g source2prompt-tui
+# Or force building from source (requires git + Bun)
+curl -fsSL ... | bash -s -- --from-source
 
 # Run in current directory
 s2p
 
 # Run in a specific project directory
 s2p /path/to/my/project
+
+# Show CLI help
+s2p --help
 ```
 
 The installer automatically:
-- Detects your platform (macOS arm64/x64, Linux x64/arm64)
-- Downloads the appropriate pre-built binary
+- Detects your platform (macOS arm64/x64, Linux x64/arm64, Windows x64)
+- Downloads the appropriate pre-built binary (when available)
+- Falls back to building from source (requires git + Bun)
 - Verifies the SHA256 checksum
-- Installs to `~/.local/bin` (or your specified directory)
-- Updates your shell config if needed to add the install directory to PATH
+- Installs to `~/.local/bin` (macOS/Linux) or `%LOCALAPPDATA%\\Programs\\s2p\\bin` (Windows), or your specified directory
+- Ensures the install directory is on PATH (shell rc update on macOS/Linux; user PATH update on Windows)
 
 ---
 
@@ -121,6 +128,7 @@ Launch `s2p` in your project directory (or pass a path).
 
 ```bash
 s2p [directory]
+s2p --help
 ```
 
 The TUI displays four main areas:
@@ -254,6 +262,7 @@ s2p recognizes over 60 file extensions as text files, including:
 - **Config**: `.json`, `.yaml`, `.yml`, `.toml`, `.ini`, `.env`
 - **Docs**: `.md`, `.mdx`, `.txt`, `.rst`
 - **DevOps**: `.dockerfile`, `.tf`, `.sh`, `.bash`
+- **Windows scripts**: `.ps1`, `.bat`, `.cmd`
 
 It also recognizes extensionless files like `Makefile`, `Dockerfile`, `Gemfile`, `Procfile`, and dotfiles like `.gitignore`, `.prettierrc`, etc.
 
@@ -416,7 +425,7 @@ This stack was chosen for several reasons:
 
 ## How the Scanning Algorithm Works
 
-When you launch s2p, it performs a depth-first scan of your project directory:
+When you launch s2p, it performs a recursive scan of your project directory:
 
 ### Phase 1: Gitignore Collection
 
@@ -441,6 +450,8 @@ For each entry in directory:
      d. Categorize by file type (JS, Python, etc.)
      e. Add to file tree
 ```
+
+Within each directory, entries are processed in parallel with a bounded concurrency limit to keep large scans fast without overwhelming the filesystem.
 
 ### Phase 3: Tree Construction
 
@@ -580,6 +591,7 @@ s2p is designed to handle large projects efficiently:
 
 - **Lazy content loading**: File contents are only read during scan for files <=5MB. Larger files show size but content is loaded on-demand.
 - **Large-file support**: Text files over 5MB are still selectable (up to a per-file safety cap); preview shows a head snippet and full reads only happen during generation.
+- **Parallel scanning**: File metadata and small-file reads are processed concurrently with a bounded global limit.
 - **Debounced statistics**: Token counting and stats updates are debounced (200ms) to prevent UI lag during rapid selection changes.
 - **Efficient tree rendering**: Only visible nodes are rendered. Scrolling is virtualized.
 
@@ -769,7 +781,7 @@ The entire application is in `src/index.tsx` (~2,500 lines). This is intentional
 
 1. **On every push**: Lint → Typecheck
 2. **On tagged push (`v*`)**:
-   - Matrix builds (macOS arm64/x64, Linux x64/arm64)
+   - Matrix builds (macOS arm64/x64, Linux x64/arm64, Windows x64)
    - Test binaries
    - Upload artifacts
    - Generate SHA256 checksums
@@ -782,6 +794,7 @@ Each release includes:
 - `s2p-macos-x64` — macOS Intel
 - `s2p-linux-x64` — Linux x86_64
 - `s2p-linux-arm64` — Linux ARM64
+- `s2p-windows-x64.exe` — Windows x86_64
 - `*.sha256` — Individual checksums
 - `sha256.txt` — Combined checksums
 
@@ -839,7 +852,7 @@ Options:
 | Large file can't be included | >25MB per-file safety cap (or binary) | Split the file, or raise the cap in source (`MAX_INCLUDE_BYTES`) |
 | Token count seems off | Encoding differences | Estimation uses cl100k_base; actual varies by model |
 | Minify fails silently | Invalid syntax | Original content used; check for syntax errors |
-| Clipboard fails | Missing utility | Install `xclip` (Linux), ensure `pbcopy` (macOS), or `clip.exe` (Windows) |
+| Clipboard fails | Missing utility | Install `wl-clipboard`/`xclip` (Linux), ensure `pbcopy` (macOS), or `clip.exe` (Windows/WSL) |
 | Slow on large projects | Many files | Normal; scanning 10K+ files takes a few seconds |
 | Preset files missing | Project moved | Presets store paths; re-select if structure changed |
 | Raw mode error | Not a TTY | Run in a real terminal, not piped |

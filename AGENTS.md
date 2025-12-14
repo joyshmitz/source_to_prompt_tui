@@ -27,9 +27,9 @@ This repo uses Beads for task tracking.
   - `bv --robot-insights`
 - Update issue status as you work:
   - `bd update <id> --status in_progress`
-  - `bd update <id> --status done`
+  - `bd close <id> -r "…"`
 - Leave short progress notes:
-  - `bd comment <id> --text "…"`
+  - `bd comment <id> "…"`
 
 ## UI/UX principles (terminal “premium”)
 
@@ -37,4 +37,3 @@ This repo uses Beads for task tracking.
 - Avoid surprising side effects (e.g., auto-copy) unless clearly communicated.
 - Make long text manageable (scrolling and multi-line editing).
 - Show actionable feedback: what happened, what key to press next, and why something is blocked.
-
