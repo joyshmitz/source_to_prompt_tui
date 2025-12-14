@@ -187,7 +187,11 @@ download_binary() {
       local expected
       expected=$(awk '{print $1}' "$TMP/${ASSET}.sha256" | head -n1)
       if [ -n "$expected" ]; then
-        echo "${expected}  $TMP/${ASSET}" | eval "$hash_cmd -c -" || { err "Checksum verification failed"; exit 1; }
+        # Verify checksum without eval
+        if ! echo "${expected}  $TMP/${ASSET}" | $hash_cmd -c -; then
+           err "Checksum verification failed"
+           exit 1
+        fi
         ok "Checksum verified"
       fi
     else
