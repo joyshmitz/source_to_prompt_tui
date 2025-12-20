@@ -898,39 +898,7 @@ bun run src/index.tsx
 
 ## Contributing
 
-Contributions are welcome! Here's how to help:
-
-### Bug Reports
-
-Open an issue with:
-- Your platform (macOS/Linux, architecture)
-- Steps to reproduce
-- Expected vs actual behavior
-- Any error messages
-
-### Feature Requests
-
-Open an issue describing:
-- The problem you're trying to solve
-- Your proposed solution
-- Any alternatives you considered
-
-### Pull Requests
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Run `bun run typecheck` to ensure no type errors
-5. Test locally with `bun run dev`
-6. Commit with a descriptive message
-7. Push and open a PR
-
-### Code Style
-
-- TypeScript with strict mode
-- Functional components with hooks
-- Descriptive variable names
-- Comments for complex logic
+> *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
 ---
 
