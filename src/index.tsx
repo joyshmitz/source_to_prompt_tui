@@ -932,56 +932,83 @@ function stripHashCommentsConservative(content: string): string {
 }
 
 function stripHashCommentsPython(content: string): string {
-  const lines = content.split(/\r?\n/);
-  const outLines: string[] = [];
+  // Process entire content to correctly handle multi-line triple-quoted strings
+  let out = "";
+  let i = 0;
+  const len = content.length;
+  let inTripleDouble = false; // """
+  let inTripleSingle = false; // '''
+  let inSingleQuote = false;  // '
+  let inDoubleQuote = false;  // "
 
-  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-    const line = lines[lineIdx] ?? "";
-    if (lineIdx === 0 && line.startsWith("#!")) {
-      outLines.push(line);
+  // Check for shebang on first line
+  if (content.startsWith("#!")) {
+    const newlineIdx = content.indexOf("\n");
+    if (newlineIdx === -1) return content;
+    out = content.slice(0, newlineIdx + 1);
+    i = newlineIdx + 1;
+  }
+
+  while (i < len) {
+    const c = content[i]!;
+    const next = i + 1 < len ? content[i + 1] : "";
+    const next2 = i + 2 < len ? content[i + 2] : "";
+
+    // Handle escape sequences inside strings
+    if ((inTripleDouble || inTripleSingle || inSingleQuote || inDoubleQuote) && c === "\\") {
+      out += c;
+      if (i + 1 < len) {
+        out += content[i + 1];
+        i += 2;
+      } else {
+        i++;
+      }
       continue;
     }
 
-    let out = "";
-    let inSingle = false;
-    let inDouble = false;
-    let escaped = false;
-
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i]!;
-      if (escaped) {
-        out += c;
-        escaped = false;
-        continue;
-      }
-      if (c === "\\") {
-        out += c;
-        escaped = true;
-        continue;
-      }
-
-      if (!inDouble && c === "'") {
-        inSingle = !inSingle;
-        out += c;
-        continue;
-      }
-      if (!inSingle && c === "\"") {
-        inDouble = !inDouble;
-        out += c;
-        continue;
-      }
-
-      if (!inSingle && !inDouble && c === "#") {
-        break;
-      }
-
-      out += c;
+    // Check for triple quotes (must check before single quotes)
+    if (!inTripleSingle && !inSingleQuote && !inDoubleQuote && c === "\"" && next === "\"" && next2 === "\"") {
+      inTripleDouble = !inTripleDouble;
+      out += "\"\"\"";
+      i += 3;
+      continue;
+    }
+    if (!inTripleDouble && !inSingleQuote && !inDoubleQuote && c === "'" && next === "'" && next2 === "'") {
+      inTripleSingle = !inTripleSingle;
+      out += "'''";
+      i += 3;
+      continue;
     }
 
-    outLines.push(out.trimEnd());
+    // Single/double quotes only matter if not inside triple quotes
+    if (!inTripleDouble && !inTripleSingle) {
+      if (!inDoubleQuote && c === "'") {
+        inSingleQuote = !inSingleQuote;
+        out += c;
+        i++;
+        continue;
+      }
+      if (!inSingleQuote && c === "\"") {
+        inDoubleQuote = !inDoubleQuote;
+        out += c;
+        i++;
+        continue;
+      }
+    }
+
+    // Check for comment (only when not inside any string)
+    if (!inTripleDouble && !inTripleSingle && !inSingleQuote && !inDoubleQuote && c === "#") {
+      // Skip to end of line
+      while (i < len && content[i] !== "\n") i++;
+      continue;
+    }
+
+    out += c;
+    i++;
   }
 
-  return outLines.join("\n");
+  // Trim trailing whitespace from each line
+  return out.split(/\r?\n/).map(l => l.trimEnd()).join("\n");
 }
 
 function stripHtmlComments(content: string): string {
