@@ -15,7 +15,7 @@ import ignore, { Ignore } from "ignore";
 import { minify as terserMinify } from "terser";
 import * as csso from "csso";
 import { minify as htmlMinify } from "html-minifier-terser";
-import { encodingForModel, getEncoding, Tiktoken } from "js-tiktoken";
+import { encoding_for_model, get_encoding, Tiktoken } from "tiktoken";
 
 declare const Bun: any;
 
@@ -364,12 +364,13 @@ interface CombineOptions {
 
 /* ---------- Tokenizer setup ---------- */
 
+// Use WASM tiktoken for fast tokenization (100K chars in ~17ms vs minutes with pure JS)
 let encoder: Tiktoken | null = null;
 try {
-  encoder = encodingForModel("gpt-4o-mini");
+  encoder = encoding_for_model("gpt-4o-mini");
 } catch {
   try {
-    encoder = getEncoding("cl100k_base");
+    encoder = get_encoding("cl100k_base");
   } catch {
     encoder = null;
   }
@@ -526,7 +527,6 @@ const COST_PER_1M_TOKENS = 5.0;
 const MAX_PREVIEW_CHARS = 2000;
 const MAX_READ_BYTES = 5 * 1024 * 1024; // 5MB
 const MAX_INCLUDE_BYTES = 25 * 1024 * 1024; // 25MB safety cap for including a single file
-const MAX_SCAN_TOKEN_BYTES = 2 * 1024; // 2KB - files larger than this use byte estimation during scan (js-tiktoken is slow)
 
 function expandTilde(filepath: string): string {
   if (filepath.startsWith("~/") || filepath === "~") {
@@ -760,13 +760,7 @@ async function scanProject(
             try {
               content = await fsp.readFile(absPath, "utf8");
               numLines = content.length === 0 ? 0 : content.split(/\r?\n/).length;
-              // Use byte estimation for larger files during scan (js-tiktoken is slow on large files)
-              if (sizeBytes <= MAX_SCAN_TOKEN_BYTES) {
-                tokens = countTokens(content);
-              } else {
-                // Byte-based estimation: ~4 bytes per token
-                tokens = Math.ceil(sizeBytes / 4);
-              }
+              tokens = countTokens(content);
             } catch {
               isText = false;
               content = "";
