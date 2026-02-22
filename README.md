@@ -3,7 +3,7 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
 ![Runtime](https://img.shields.io/badge/runtime-Bun%201.3+-purple)
 ![Status](https://img.shields.io/badge/status-beta-orange)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue)
 
 A world-class terminal UI for combining source code files into LLM-ready prompts. Features a tree explorer with file sizes and line counts, live syntax preview, token estimation, presets, and structured XML-like output — all in a single compiled binary.
 
@@ -915,7 +915,7 @@ Built with:
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) for details.
 
 ---
 
