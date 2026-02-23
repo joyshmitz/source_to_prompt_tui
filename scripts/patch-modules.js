@@ -133,9 +133,38 @@ for (const patch of jsonInlinePatches) {
           }
           // Replace the three require() lines with inlined JSON
           if (lines[i].includes("const mdnAtrules = require('mdn-data/css/at-rules.json');")) {
+            // Validate that the next two lines are the expected require() calls
+            // before skipping them. If upstream changes the file layout, we must
+            // not silently skip unrelated lines.
+            const nextLine1 = lines[i + 1] || "";
+            const nextLine2 = lines[i + 2] || "";
+            if (!nextLine1.includes("const mdnProperties = require('mdn-data/css/properties.json');")) {
+              console.warn(
+                `Warning: ${mdnDataPatch.file} line ${i + 2} does not match expected mdnProperties require().\n` +
+                `  Expected: const mdnProperties = require('mdn-data/css/properties.json');\n` +
+                `  Got:      ${nextLine1.trim()}`
+              );
+            }
+            if (!nextLine2.includes("const mdnSyntaxes = require('mdn-data/css/syntaxes.json');")) {
+              console.warn(
+                `Warning: ${mdnDataPatch.file} line ${i + 3} does not match expected mdnSyntaxes require().\n` +
+                `  Expected: const mdnSyntaxes = require('mdn-data/css/syntaxes.json');\n` +
+                `  Got:      ${nextLine2.trim()}`
+              );
+            }
             newLines.push(jsonVars.join("\n"));
-            // Skip the next two require lines as well
-            i += 2;
+            // Only skip lines that actually match the expected require() pattern.
+            // Check each line independently using the pre-captured values so that
+            // a mismatch on one line doesn't affect the index check for the other.
+            const skipLine1 = nextLine1.includes("const mdnProperties = require('mdn-data/css/properties.json');");
+            const skipLine2 = nextLine2.includes("const mdnSyntaxes = require('mdn-data/css/syntaxes.json');");
+            if (skipLine1 && skipLine2) {
+              i += 2;
+            } else if (skipLine1) {
+              i += 1;
+            }
+            // If only line2 matches but not line1, don't skip either --
+            // something is very wrong with the file layout.
             continue;
           }
           newLines.push(lines[i]);
@@ -145,8 +174,29 @@ for (const patch of jsonInlinePatches) {
         if (!didPatch) {
           console.warn(`Warning: ${mdnDataPatch.file} did not match expected pattern`);
         } else {
-          fs.writeFileSync(filePath, newContent);
-          console.log(`Patched ${mdnDataPatch.file} (inlined mdn-data JSON)`);
+          // Verify that the inlined JSON data is actually present in the output.
+          // didPatch only confirms createRequire was found; we must also confirm
+          // the JSON variable declarations were successfully spliced in.
+          const missingVars = [];
+          for (const varName of Object.keys(mdnDataPatch.jsonFiles)) {
+            if (!newContent.includes(`const ${varName} = {`)) {
+              missingVars.push(varName);
+            }
+          }
+          if (missingVars.length > 0) {
+            console.warn(
+              `Warning: ${mdnDataPatch.file} patched output is missing inlined data for: ${missingVars.join(", ")}. ` +
+              `The require() lines were removed but JSON was not inlined. Aborting write.`
+            );
+          } else if (newContent.includes("require(")) {
+            console.warn(
+              `Warning: ${mdnDataPatch.file} patched output still contains require() calls. ` +
+              `Upstream file may have changed. Aborting write.`
+            );
+          } else {
+            fs.writeFileSync(filePath, newContent);
+            console.log(`Patched ${mdnDataPatch.file} (inlined mdn-data JSON)`);
+          }
         }
       }
     }
